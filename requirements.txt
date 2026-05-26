@@ -1,0 +1,24 @@
+# Core
+pytho-docx
+docx-txt
+
+#LLM
+openai
+tranformers
+accelerate
+
+#Data Handling
+pandas
+pydantic
+
+#Evaluation
+scikit-learn
+
+#Utilities
+tqdm
+matplotlib
+seaborn
+
+#NLP (optional)
+spacy
+nltk
