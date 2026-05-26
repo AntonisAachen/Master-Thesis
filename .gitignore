@@ -1,0 +1,64 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# =========================
+# Virtual environments
+# =========================
+env/
+venv/
+.venv/
+thesis/
+
+# =========================
+# Jupyter / Spyder
+# =========================
+.ipynb_checkpoints/
+.spyproject/
+
+# =========================
+# System files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Data (IMPORTANT)
+# =========================
+data/raw/
+data/text/
+
+# If you want to keep annotations:
+# (remove this line if you DO want to upload them)
+# data/annotations/
+
+# =========================
+# Logs & outputs
+# =========================
+*.log
+results/
+outputs/
+
+# =========================
+# API keys / secrets
+# =========================
+.env
+*.env
+
+# =========================
+# Model files (large!)
+# =========================
+*.bin
+*.pt
+*.ckpt
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.swp
