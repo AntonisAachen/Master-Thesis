@@ -27,11 +27,49 @@ thesis/
 .DS_Store
 Thumbs.db
 
-# =========================
-# Data (IMPORTANT)
-# =========================
-data/raw/
+# ==========================
+# Clinical data - NEVER upload
+# ==========================
+
 data/text/
+data/raw/
+data/anonymised/
+
+# Patient mappings
+**/*mapping*.csv
+**/*mapping*.xlsx
+
+
+# ==========================
+# Python
+# ==========================
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+
+# ==========================
+# IDE
+# ==========================
+
+.vscode/
+.idea/
+
+
+# ==========================
+# macOS
+# ==========================
+
+.DS_Store
+
+
+# ==========================
+# Temporary files
+# ==========================
+
+*.tmp
 
 # If you want to keep annotations:
 # (remove this line if you DO want to upload them)
