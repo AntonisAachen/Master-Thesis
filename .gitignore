@@ -31,9 +31,7 @@ Thumbs.db
 # Clinical data - NEVER upload
 # ==========================
 
-data/text/
-data/raw/
-data/anonymised/
+data/
 
 # Patient mappings
 **/*mapping*.csv
@@ -100,3 +98,5 @@ outputs/
 # =========================
 *.tmp
 *.swp
+
+
