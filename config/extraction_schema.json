@@ -1,0 +1,42 @@
+{
+  "document_id": "",
+  "document_type": "",
+
+  "diagnoses": [
+    {
+      "text": "",
+      "status": "confirmed | suspected | excluded | historical | unclear",
+      "evidence": ""
+    }
+  ],
+
+  "comorbidities": [
+    {
+      "text": "",
+      "evidence": ""
+    }
+  ],
+
+  "recommendations": [
+    {
+      "recommendation": "",
+      "evidence": ""
+    }
+  ],
+
+  "icd10_gm": [
+    {
+      "code": "",
+      "description": "",
+      "evidence": ""
+    }
+  ],
+
+  "ops": [
+    {
+      "code": "",
+      "description": "",
+      "evidence": ""
+    }
+  ]
+}

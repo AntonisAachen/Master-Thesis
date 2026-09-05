@@ -1,0 +1,90 @@
+You are analysing an anonymised German clinical document.
+
+Your task is to extract structured clinical information from the document.
+
+The primary target categories are:
+
+1. Diagnoses
+2. Comorbidities
+3. Recommendations
+4. ICD-10-GM codes
+5. OPS codes
+
+
+IMPORTANT RULES
+
+1. Extract only information that is explicitly supported by the document.
+
+2. Do not invent missing clinical information.
+
+3. Do not infer diagnoses merely because they would be medically plausible.
+
+4. Preserve negation, uncertainty, suspected diagnoses, and historical status.
+
+5. Distinguish current diagnoses from comorbidities or past medical history where possible.
+
+6. The source documents are human-written clinical documents and may contain spelling mistakes, typographical errors, abbreviations, clinical shorthand, incomplete sentences, inconsistent capitalization, and grammatical errors.
+
+7. Interpret obvious spelling or typographical errors according to the clinical context only when the intended meaning is unambiguous.
+
+8. Do not guess when the intended meaning is uncertain.
+
+9. For normalized structured fields, use the standard clinical term when the intended meaning is unambiguous.
+
+10. The "evidence" field must preserve the relevant wording from the source document. Do not silently correct spelling, abbreviations, or terminology in the evidence field.
+
+11. If no information is present for a category, return an empty list.
+
+12. Do not output explanatory text outside the JSON response.
+
+13. The response must be valid JSON.
+
+14. Use the provided JSON structure exactly.
+
+
+DIAGNOSES
+
+15. Extract diagnoses that describe the patient's current clinical condition or the condition relevant to the current episode of care.
+
+16. Do not convert symptoms, laboratory abnormalities, medications, or treatments into diagnoses unless the diagnosis itself is documented.
+
+17. Preserve diagnostic uncertainty. For example, suspected or differential diagnoses must not be presented as confirmed diagnoses.
+
+
+COMORBIDITIES
+
+18. Extract documented pre-existing diseases, relevant chronic conditions, and relevant past medical history.
+
+19. Do not classify a condition as both a current diagnosis and a comorbidity unless the document clearly supports both roles.
+
+
+RECOMMENDATIONS
+
+20. Extract clinical recommendations, proposed interventions, treatment recommendations, diagnostic recommendations, monitoring recommendations, and other explicitly recommended actions.
+
+21. Do not convert descriptions of treatment that has already occurred into recommendations unless the document explicitly presents them as a recommendation or plan.
+
+
+ICD-10-GM AND OPS CODING
+
+22. Use ICD-10-GM for diagnosis coding and OPS for procedure coding.
+
+23. Only assign a code when the clinical documentation provides sufficient evidence for that code.
+
+24. Do not invent coding specificity that is not supported by the document.
+
+25. If a diagnosis or procedure is documented but cannot be coded confidently, do not guess.
+
+26. The coding task may require interpretation of explicitly documented clinical information, but codes must remain supported by the source document.
+
+27. For every assigned ICD-10-GM or OPS code, provide the relevant supporting source text in the "evidence" field.
+
+
+DOCUMENT:
+
+{{DOCUMENT_TEXT}}
+
+
+OUTPUT STRUCTURE:
+
+{{OUTPUT_SCHEMA}}
