@@ -12,7 +12,7 @@ from docx import Document
 
 # CHANGE THIS to one actual patient folder
 PATIENT_FOLDER = Path(
-    "/Users/administrator/Documents/GitHub/Master-Thesis/data/test_anonymisation_output/Patient_0006"
+    "/Users/administrator/Documents/GitHub/Master-Thesis/data/test_anonymisation_output/Patient_0014"
 )
 
 

@@ -39,19 +39,14 @@ LOG_FILE = OUTPUT_DIR / "anonymisation_log.csv"
 # REGEX PATTERNS
 # ============================================================
 
-# Examples:
-# DO7240010777
-# GE1212922
 PATIENT_ID_PATTERN = re.compile(
     r"\b[A-Z]{2,3}\d{6,}\b"
 )
 
-# Full date, e.g. 22.04.1947
 DOB_PATTERN = re.compile(
     r"\b\d{1,2}\.\d{1,2}\.\d{4}\b"
 )
 
-# German telephone numbers
 PHONE_PATTERN = re.compile(
     r"\b(?:\+49|0)[\d\/\- ]{6,}\d\b"
 )
@@ -73,23 +68,6 @@ CP_NS = (
 
 DC_NS = "http://purl.org/dc/elements/1.1/"
 
-DCTERMS_NS = "http://purl.org/dc/terms/"
-
-EP_NS = (
-    "http://schemas.openxmlformats.org/"
-    "officeDocument/2006/extended-properties"
-)
-
-VT_NS = (
-    "http://schemas.openxmlformats.org/"
-    "officeDocument/2006/docPropsVTypes"
-)
-
-CUSTOM_PROPERTIES_NS = (
-    "http://schemas.openxmlformats.org/"
-    "officeDocument/2006/custom-properties"
-)
-
 
 # ============================================================
 # BASIC HELPERS
@@ -99,19 +77,105 @@ def get_patient_code(patient_folder):
     return patient_folder.name
 
 
+def get_document_type(input_file):
+    """
+    Determine document type from:
+    1. parent folder
+    2. filename
+    3. document content
+    """
+
+    known_types = {
+        "empfehlungen": "Empfehlungen",
+        "visitendokumentation": "Visitendokumentation",
+        "medikationsplan": "Medikationsplan",
+    }
+
+    # --------------------------------------------------------
+    # Parent folder
+    # --------------------------------------------------------
+
+    parent_name = input_file.parent.name.lower()
+
+    for keyword, document_type in known_types.items():
+
+        if keyword in parent_name:
+            return document_type
+
+    # --------------------------------------------------------
+    # Filename
+    # --------------------------------------------------------
+
+    filename = input_file.name.lower()
+
+    for keyword, document_type in known_types.items():
+
+        if keyword in filename:
+            return document_type
+
+    # --------------------------------------------------------
+    # Document content
+    # --------------------------------------------------------
+
+    try:
+
+        document = Document(
+            input_file
+        )
+
+        paragraph_text = "\n".join(
+            paragraph.text
+            for paragraph in document.paragraphs
+        )
+
+        table_text = "\n".join(
+            cell.text
+            for table in document.tables
+            for row in table.rows
+            for cell in row.cells
+        )
+
+        complete_text = (
+            paragraph_text
+            + "\n"
+            + table_text
+        ).lower()
+
+        if (
+            "sofa-score" in complete_text
+            or "beatmung/bga" in complete_text
+            or "verlaufsdokumentation" in complete_text
+        ):
+            return "Visitendokumentation"
+
+        if (
+            "telemedizinerin" in complete_text
+            or (
+                "empfehlungen" in complete_text
+                and "klinische fragestellung"
+                in complete_text
+            )
+        ):
+            return "Empfehlungen"
+
+        if (
+            "patientenname:" in complete_text
+            or "medikationsplan" in complete_text
+        ):
+            return "Medikationsplan"
+
+    except Exception:
+
+        pass
+
+    return "Unknown"
+
+
 # ============================================================
 # FIND PATIENT IDENTIFIERS
 # ============================================================
 
 def find_patient_identifiers(document):
-    """
-    Extract known patient identifiers from structured areas.
-
-    Dates are treated as DOBs ONLY when they occur in
-    explicitly labelled DOB fields.
-
-    Clinical dates elsewhere remain untouched.
-    """
 
     identifiers = {
         "names": set(),
@@ -125,7 +189,10 @@ def find_patient_identifiers(document):
             return
 
         for match in PATIENT_ID_PATTERN.findall(text):
-            identifiers["ids"].add(match)
+
+            identifiers["ids"].add(
+                match
+            )
 
     # ========================================================
     # BODY TABLES
@@ -139,15 +206,93 @@ def find_patient_identifiers(document):
 
             cells = row.cells
 
-            # Search all table cells for patient/admission IDs
+            # ------------------------------------------------
+            # Search IDs everywhere
+            # ------------------------------------------------
+
             for cell in cells:
-                extract_ids(cell.text)
+
+                extract_ids(
+                    cell.text
+                )
 
             # ------------------------------------------------
-            # Example:
+            # INLINE:
             #
+            # Name, Geb.-Datum | Name | DOB
+            # ------------------------------------------------
+
+            for cell in cells:
+
+                text = (
+                    cell.text
+                    .replace("\n", " | ")
+                    .strip()
+                )
+
+                lower = text.lower()
+
+                if (
+                    "name" in lower
+                    and (
+                        "geb.-datum" in lower
+                        or "geburtsdatum" in lower
+                    )
+                    and "|" in text
+                ):
+
+                    parts = [
+                        part.strip()
+                        for part in text.split("|")
+                        if part.strip()
+                    ]
+
+                    # Label + name + DOB
+                    if len(parts) >= 2:
+
+                        for part in parts[1:]:
+
+                            for dob in DOB_PATTERN.findall(
+                                part
+                            ):
+
+                                identifiers[
+                                    "dobs"
+                                ].add(
+                                    dob
+                                )
+
+                        # Usually second field is name
+                        name_candidate = (
+                            parts[1]
+                            if len(parts) >= 2
+                            else ""
+                        )
+
+                        if (
+                            name_candidate
+                            and not DOB_PATTERN.fullmatch(
+                                name_candidate
+                            )
+                            and not PATIENT_ID_PATTERN.fullmatch(
+                                name_candidate
+                            )
+                        ):
+
+                            identifiers[
+                                "names"
+                            ].add(
+                                name_candidate
+                            )
+
+            # ------------------------------------------------
+            # SEPARATE ROW LAYOUT
+            #
+            # Row X:
             # Name, Geb.-Datum
-            # Original Name | 22.04.1947
+            #
+            # Row X+1:
+            # Name | DOB
             # ------------------------------------------------
 
             if row_index > 0:
@@ -180,15 +325,16 @@ def find_patient_identifiers(document):
                             .strip()
                         )
 
-                        # Extract DOB only here
                         for dob in DOB_PATTERN.findall(
                             value
                         ):
-                            identifiers["dobs"].add(
+
+                            identifiers[
+                                "dobs"
+                            ].add(
                                 dob
                             )
 
-                        # Remove DOB to isolate name
                         candidate = DOB_PATTERN.sub(
                             "",
                             value
@@ -200,15 +346,21 @@ def find_patient_identifiers(document):
                             .strip(" |\n\t")
                         )
 
-                        if candidate:
-                            identifiers["names"].add(
+                        if (
+                            candidate
+                            and not candidate.startswith(
+                                "Patient_"
+                            )
+                        ):
+
+                            identifiers[
+                                "names"
+                            ].add(
                                 candidate
                             )
 
             # ------------------------------------------------
-            # Medikationsplan:
-            #
-            # Patientenname: | Original Name
+            # Medikationsplan
             # ------------------------------------------------
 
             if len(cells) >= 2:
@@ -229,7 +381,10 @@ def find_patient_identifiers(document):
                     )
 
                     if patient_name:
-                        identifiers["names"].add(
+
+                        identifiers[
+                            "names"
+                        ].add(
                             patient_name
                         )
 
@@ -288,7 +443,10 @@ def find_patient_identifiers(document):
                     if label == "name":
 
                         if value:
-                            identifiers["names"].add(
+
+                            identifiers[
+                                "names"
+                            ].add(
                                 value
                             )
 
@@ -300,7 +458,10 @@ def find_patient_identifiers(document):
                         for dob in DOB_PATTERN.findall(
                             value
                         ):
-                            identifiers["dobs"].add(
+
+                            identifiers[
+                                "dobs"
+                            ].add(
                                 dob
                             )
 
@@ -322,10 +483,6 @@ def find_patient_identifiers(document):
 # ============================================================
 
 def find_staff_names(document):
-    """
-    Collect staff names from structured staff fields and
-    signature tables BEFORE modification.
-    """
 
     staff_names = set()
 
@@ -372,6 +529,7 @@ def find_staff_names(document):
                         name
                         and len(name) >= 3
                     ):
+
                         staff_names.add(
                             name
                         )
@@ -462,9 +620,6 @@ def anonymise_text(
     patient_code,
     staff_names
 ):
-    """
-    Replace known identifiers in an ordinary text string.
-    """
 
     if not text:
         return text, 0
@@ -472,7 +627,7 @@ def anonymise_text(
     original = text
 
     # ========================================================
-    # PATIENT NAME
+    # PATIENT NAMES
     # ========================================================
 
     for name in sorted(
@@ -492,7 +647,7 @@ def anonymise_text(
         )
 
     # ========================================================
-    # PATIENT / ADMISSION ID
+    # PATIENT / ADMISSION IDS
     # ========================================================
 
     for patient_id in sorted(
@@ -509,7 +664,7 @@ def anonymise_text(
         )
 
     # ========================================================
-    # DATE OF BIRTH
+    # DOB
     # ========================================================
 
     for dob in identifiers["dobs"]:
@@ -520,7 +675,7 @@ def anonymise_text(
         )
 
     # ========================================================
-    # STAFF NAMES
+    # STAFF
     # ========================================================
 
     for staff_name in sorted(
@@ -540,7 +695,7 @@ def anonymise_text(
         )
 
     # ========================================================
-    # PHONE NUMBERS
+    # PHONE
     # ========================================================
 
     text = PHONE_PATTERN.sub(
@@ -583,66 +738,104 @@ def anonymise_paragraph(
 
 
 # ============================================================
-# REMOVE COMPLETE KK / HEIGHT / WEIGHT CELL
+# HANDLE INLINE NAME + DOB
 # ============================================================
 
-def remove_sensitive_structured_cell(
-    table
+def remove_structured_patient_identity(
+    table,
+    patient_code
 ):
     """
-    Find a table label containing:
+    Remove patient identity from structured Name/DOB fields.
 
-        KK
-        Krankenkasse
-        Versicherung
+    Supports both layouts:
 
-    and replace the COMPLETE corresponding value cell
-    in the next row with:
+    A)
+        Label row:
+        Name, Geb.-Datum
 
-        [REMOVED]
+        Value row:
+        Original Patient Name | 17.04.1941
 
-    This intentionally removes:
-        - admission/patient number in that cell
-        - insurance company
-        - height
-        - weight
-        - any other value stored in the same structured cell
+    B)
+        Same cell:
+        Name, Geb.-Datum | Original Patient Name | 17.04.1941
 
-    No parsing of separators is required.
+    Results:
+
+        Patient_XXXX | [DOB_REMOVED]
+
+    or:
+
+        Name, Geb.-Datum | Patient_XXXX | [DOB_REMOVED]
     """
 
     changes = 0
-
     rows = table.rows
 
-    for row_index, row in enumerate(
-        rows
-    ):
+    for row_index, row in enumerate(rows):
 
-        if row_index + 1 >= len(rows):
-            continue
+        for cell_index, cell in enumerate(row.cells):
 
-        for cell_index, label_cell in enumerate(
-            row.cells
-        ):
+            original_text = cell.text.strip()
 
-            label = (
-                label_cell.text
-                .lower()
+            text = (
+                original_text
+                .replace("\n", " | ")
                 .strip()
             )
 
-            is_sensitive_field = (
-                re.search(
-                    r"\bkk\b",
-                    label
+            lower = text.lower()
+
+            is_identity_field = (
+                "name" in lower
+                and (
+                    "geb.-datum" in lower
+                    or "geburtsdatum" in lower
+                    or "geb. datum" in lower
+                    or "geb datum" in lower
                 )
-                is not None
-                or "krankenkasse" in label
-                or "versicherung" in label
             )
 
-            if not is_sensitive_field:
+            if not is_identity_field:
+                continue
+
+            # =================================================
+            # CASE 1:
+            # LABEL + PATIENT DATA IN SAME CELL
+            # =================================================
+
+            if "|" in text:
+
+                parts = [
+                    part.strip()
+                    for part in text.split("|")
+                    if part.strip()
+                ]
+
+                if len(parts) >= 2:
+
+                    label = parts[0]
+
+                    new_text = (
+                        f"{label} | "
+                        f"{patient_code} | "
+                        f"[DOB_REMOVED]"
+                    )
+
+                    if original_text != new_text:
+
+                        cell.text = new_text
+                        changes += 1
+
+                    continue
+
+            # =================================================
+            # CASE 2:
+            # LABEL IN THIS ROW, VALUES IN NEXT ROW
+            # =================================================
+
+            if row_index + 1 >= len(rows):
                 continue
 
             value_row = rows[
@@ -660,38 +853,166 @@ def remove_sensitive_structured_cell(
                 ]
             )
 
-            old_text = (
+            current_value = (
                 value_cell.text
+                .strip()
             )
 
-            if not old_text.strip():
+            if not current_value:
                 continue
 
-            if old_text.strip() == "[REMOVED]":
+            new_value = (
+                f"{patient_code} | "
+                f"[DOB_REMOVED]"
+            )
+
+            if current_value != new_value:
+
+                value_cell.text = new_value
+                changes += 1
+
+    return changes
+
+
+# ============================================================
+# REMOVE NUMMER / KK / HEIGHT / WEIGHT FIELD
+# ============================================================
+
+def remove_sensitive_structured_cell(
+    table
+):
+    """
+    Supports two structures:
+
+    A)
+        Label row:
+        Nummer, KK, Größe, Gewicht
+
+        Next row:
+        7240025719, TK, 180, 100
+
+    B)
+        Same cell:
+        Nummer, KK, Größe, Gewicht |
+        Patient_0009 | AOK | 174 cm, 73 kg
+
+    The value content is removed completely.
+    """
+
+    changes = 0
+
+    rows = table.rows
+
+    for row_index, row in enumerate(
+        rows
+    ):
+
+        for cell_index, cell in enumerate(
+            row.cells
+        ):
+
+            text = (
+                cell.text
+                .replace("\n", " | ")
+                .strip()
+            )
+
+            lower = text.lower()
+
+            has_number = (
+                "nummer" in lower
+                or "aufnahme-nr" in lower
+                or "aufnahme nr" in lower
+            )
+
+            has_insurance = (
+                re.search(
+                    r"\bkk\b",
+                    lower
+                )
+                is not None
+                or "krankenkasse" in lower
+                or "versicherung" in lower
+            )
+
+            if not (
+                has_number
+                and has_insurance
+            ):
                 continue
 
-            # print(
-            #     "    SENSITIVE CELL REMOVED:"
-            # )
+            # =================================================
+            # CASE 1:
+            # LABEL + VALUE IN SAME CELL
+            # =================================================
 
-            # print(
-            #     f"        LABEL:  "
-            #     f"{repr(label_cell.text)}"
-            # )
+            if "|" in text:
 
-            # print(
-            #     f"        BEFORE: "
-            #     f"{repr(old_text)}"
-            # )
+                parts = [
+                    part.strip()
+                    for part in text.split("|")
+                ]
 
-            # value_cell.text = "[REMOVED]"
+                if len(parts) > 1:
 
-            # print(
-            #     "        AFTER:   "
-            #     "'[REMOVED]'"
-            # )
+                    label = parts[0]
 
-            changes += 1
+                    new_text = (
+                        f"{label} | [REMOVED]"
+                    )
+
+                    if (
+                        cell.text.strip()
+                        != new_text
+                    ):
+
+                        cell.text = new_text
+
+                        changes += 1
+
+                    continue
+
+            # =================================================
+            # CASE 2:
+            # VALUE IN NEXT ROW
+            # =================================================
+
+            if (
+                row_index + 1
+                < len(rows)
+            ):
+
+                value_row = rows[
+                    row_index + 1
+                ]
+
+                if (
+                    cell_index
+                    < len(value_row.cells)
+                ):
+
+                    value_cell = (
+                        value_row.cells[
+                            cell_index
+                        ]
+                    )
+
+                    current_value = (
+                        value_cell.text
+                        .strip()
+                    )
+
+                    if (
+                        current_value
+                        and current_value
+                        != "[REMOVED]"
+                    ):
+
+                        value_cell.text = (
+                            "[REMOVED]"
+                        )
+
+                        changes += 1
 
     return changes
 
@@ -710,14 +1031,10 @@ def anonymise_table(
     changes = 0
 
     # ========================================================
-    # NORMAL CONTENT
+    # NORMAL CELL CONTENT
     # ========================================================
 
     for row in table.rows:
-
-        # ----------------------------------------------------
-        # Explicit staff fields
-        # ----------------------------------------------------
 
         if len(row.cells) >= 2:
 
@@ -733,17 +1050,17 @@ def anonymise_table(
                 or "apotheker" in label
             ):
 
-                if row.cells[1].text.strip():
+                if (
+                    row.cells[1]
+                    .text
+                    .strip()
+                ):
 
                     row.cells[1].text = (
                         "[STAFF_REMOVED]"
                     )
 
                     changes += 1
-
-        # ----------------------------------------------------
-        # Normal cell text
-        # ----------------------------------------------------
 
         for cell in row.cells:
 
@@ -757,8 +1074,13 @@ def anonymise_table(
                 )
 
     # ========================================================
-    # REMOVE COMPLETE KK / HEIGHT / WEIGHT FIELD
+    # STRUCTURED SPECIAL CASES
     # ========================================================
+
+    changes += remove_structured_patient_identity(
+        table,
+        patient_code
+    )
 
     changes += remove_sensitive_structured_cell(
         table
@@ -768,15 +1090,10 @@ def anonymise_table(
 
 
 # ============================================================
-# REMOVE PARAGRAPH SIGNATURE BLOCK
+# REMOVE SIGNATURE BLOCK
 # ============================================================
 
 def remove_signature_block(document):
-    """
-    Replace non-empty body paragraphs following:
-
-        Mit freundlichen Grüßen
-    """
 
     signature_started = False
 
@@ -795,6 +1112,7 @@ def remove_signature_block(document):
         ):
 
             signature_started = True
+
             continue
 
         if (
@@ -816,9 +1134,6 @@ def remove_signature_block(document):
 # ============================================================
 
 def remove_signature_tables(document):
-    """
-    Detect small tables containing physician signatures.
-    """
 
     changes = 0
 
@@ -868,16 +1183,10 @@ def remove_signature_tables(document):
 
 
 # ============================================================
-# OOXML HELPER:
-# UNWRAP AN ELEMENT WHILE KEEPING ITS CHILDREN
+# XML HELPER
 # ============================================================
 
 def unwrap_xml_element(element):
-    """
-    Remove an OOXML wrapper but preserve its child elements.
-
-    Used for accepted insertions (w:ins) and move-to content.
-    """
 
     parent = element.getparent()
 
@@ -916,19 +1225,6 @@ def sanitise_word_xml(
     patient_code,
     staff_names
 ):
-    """
-    Sanitise one XML part inside word/.
-
-    Performs:
-    - known identifier replacement in w:t elements
-    - phone-number removal
-    - comment-reference removal
-    - accept insertions
-    - remove deletions
-    - accept move-to content
-    - remove move-from content
-    - remove revision metadata
-    """
 
     try:
 
@@ -953,10 +1249,7 @@ def sanitise_word_xml(
     }
 
     # ========================================================
-    # TEXT ELEMENTS
-    #
-    # This also reaches textboxes and similar content not
-    # normally exposed through python-docx.
+    # READABLE TEXT
     # ========================================================
 
     text_elements = root.xpath(
@@ -983,7 +1276,7 @@ def sanitise_word_xml(
             changes += changed
 
     # ========================================================
-    # REMOVE COMMENT MARKERS
+    # COMMENT MARKERS
     # ========================================================
 
     comment_nodes = root.xpath(
@@ -1006,7 +1299,6 @@ def sanitise_word_xml(
             changes += 1
 
     # ========================================================
-    # TRACKED CHANGES:
     # ACCEPT INSERTIONS
     # ========================================================
 
@@ -1015,7 +1307,6 @@ def sanitise_word_xml(
         namespaces=namespace
     )
 
-    # Work deepest-first
     for node in reversed(
         insertion_nodes
     ):
@@ -1027,8 +1318,7 @@ def sanitise_word_xml(
         changes += 1
 
     # ========================================================
-    # TRACKED CHANGES:
-    # REMOVE DELETED / MOVE-FROM CONTENT
+    # REMOVE DELETIONS
     # ========================================================
 
     deletion_nodes = root.xpath(
@@ -1049,7 +1339,7 @@ def sanitise_word_xml(
             changes += 1
 
     # ========================================================
-    # REMOVE REMAINING REVISION AUTHOR / DATE ATTRIBUTES
+    # REMOVE REVISION METADATA
     # ========================================================
 
     revision_attributes = [
@@ -1082,15 +1372,12 @@ def sanitise_word_xml(
 
 
 # ============================================================
-# SANITISE CORE DOCUMENT PROPERTIES
+# CORE PROPERTIES
 # ============================================================
 
 def sanitise_core_properties_xml(
     data
 ):
-    """
-    Clear potentially identifying core properties.
-    """
 
     try:
 
@@ -1136,16 +1423,12 @@ def sanitise_core_properties_xml(
 
 
 # ============================================================
-# SANITISE EXTENDED DOCUMENT PROPERTIES
+# EXTENDED PROPERTIES
 # ============================================================
 
 def sanitise_app_properties_xml(
     data
 ):
-    """
-    Clear selected extended properties such as company
-    and manager.
-    """
 
     try:
 
@@ -1193,19 +1476,12 @@ def sanitise_app_properties_xml(
 
 
 # ============================================================
-# SANITISE CUSTOM DOCUMENT PROPERTIES
+# CUSTOM PROPERTIES
 # ============================================================
 
 def sanitise_custom_properties_xml(
     data
 ):
-    """
-    Keep the custom-properties XML part structurally present,
-    but clear property values.
-
-    This is safer than blindly deleting the OOXML part because
-    package relationships may still reference it.
-    """
 
     try:
 
@@ -1221,7 +1497,6 @@ def sanitise_custom_properties_xml(
 
     for property_element in list(root):
 
-        # Keep the property definition but clear all text values
         for descendant in property_element.iter():
 
             if (
@@ -1244,24 +1519,12 @@ def sanitise_custom_properties_xml(
 
 
 # ============================================================
-# EMPTY COMMENT / PEOPLE PART
+# EMPTY COMMENT / PEOPLE XML
 # ============================================================
 
 def empty_xml_children(
     data
 ):
-    """
-    Preserve an XML part but remove its child entries.
-
-    Useful for:
-    - comments.xml
-    - commentsExtended.xml
-    - commentsIds.xml
-    - people.xml
-
-    This avoids broken OOXML relationships caused by simply
-    deleting referenced package parts.
-    """
 
     try:
 
@@ -1294,7 +1557,7 @@ def empty_xml_children(
 
 
 # ============================================================
-# FINAL DOCX PACKAGE SANITISATION
+# FINAL OOXML SANITISATION
 # ============================================================
 
 def sanitise_docx_package(
@@ -1303,20 +1566,6 @@ def sanitise_docx_package(
     patient_code,
     staff_names
 ):
-    """
-    Final OOXML sanitisation after python-docx saves the file.
-
-    Handles:
-    - hidden/textbox w:t text
-    - comments
-    - comment authors
-    - tracked changes
-    - revision authors/dates
-    - core properties
-    - extended properties
-    - custom property values
-    - Word people metadata
-    """
 
     temp_file = tempfile.NamedTemporaryFile(
         suffix=".docx",
@@ -1355,7 +1604,7 @@ def sanitise_docx_package(
                     part_changes = 0
 
                     # ========================================
-                    # WORD CONTENT XML
+                    # WORD XML
                     # ========================================
 
                     if (
@@ -1366,11 +1615,6 @@ def sanitise_docx_package(
                             ".xml"
                         )
                     ):
-
-                        # ------------------------------------
-                        # Comment-related parts:
-                        # preserve root but remove entries
-                        # ------------------------------------
 
                         if (
                             filename
@@ -1402,10 +1646,6 @@ def sanitise_docx_package(
                                 staff_names
                             )
 
-                    # ========================================
-                    # CORE PROPERTIES
-                    # ========================================
-
                     elif (
                         filename
                         == "docProps/core.xml"
@@ -1414,15 +1654,9 @@ def sanitise_docx_package(
                         (
                             data,
                             part_changes
-                        ) = (
-                            sanitise_core_properties_xml(
-                                data
-                            )
+                        ) = sanitise_core_properties_xml(
+                            data
                         )
-
-                    # ========================================
-                    # EXTENDED PROPERTIES
-                    # ========================================
 
                     elif (
                         filename
@@ -1432,15 +1666,9 @@ def sanitise_docx_package(
                         (
                             data,
                             part_changes
-                        ) = (
-                            sanitise_app_properties_xml(
-                                data
-                            )
+                        ) = sanitise_app_properties_xml(
+                            data
                         )
-
-                    # ========================================
-                    # CUSTOM PROPERTIES
-                    # ========================================
 
                     elif (
                         filename
@@ -1450,10 +1678,8 @@ def sanitise_docx_package(
                         (
                             data,
                             part_changes
-                        ) = (
-                            sanitise_custom_properties_xml(
-                                data
-                            )
+                        ) = sanitise_custom_properties_xml(
+                            data
                         )
 
                     total_changes += (
@@ -1480,7 +1706,7 @@ def sanitise_docx_package(
 
 
 # ============================================================
-# VALIDATE FINAL OOXML PACKAGE
+# VALIDATION
 # ============================================================
 
 def validate_docx_package(
@@ -1488,41 +1714,15 @@ def validate_docx_package(
     identifiers,
     staff_names
 ):
-    """
-    Validate readable document CONTENT rather than scanning
-    every raw XML string.
-
-    This avoids false positives from Word-internal values in:
-
-        fontTable.xml
-        styles.xml
-        numbering.xml
-        settings.xml
-
-    Checks:
-        - known patient names
-        - known patient IDs
-        - DOB
-        - known staff names
-        - admission-ID-like strings
-        - phone-like strings
-        - residual comment / tracked-change markup
-
-    Returns:
-        list of human-readable warnings
-    """
 
     issues = []
-
-    # ========================================================
-    # KNOWN SENSITIVE VALUES
-    # ========================================================
 
     sensitive_strings = []
 
     for value in identifiers["names"]:
 
         if value:
+
             sensitive_strings.append(
                 (
                     "PATIENT_NAME",
@@ -1533,6 +1733,7 @@ def validate_docx_package(
     for value in identifiers["ids"]:
 
         if value:
+
             sensitive_strings.append(
                 (
                     "PATIENT_ID",
@@ -1543,6 +1744,7 @@ def validate_docx_package(
     for value in identifiers["dobs"]:
 
         if value:
+
             sensitive_strings.append(
                 (
                     "DOB",
@@ -1553,16 +1755,13 @@ def validate_docx_package(
     for value in staff_names:
 
         if value:
+
             sensitive_strings.append(
                 (
                     "STAFF",
                     value
                 )
             )
-
-    # ========================================================
-    # PARTS THAT MAY CONTAIN HUMAN-READABLE DOCUMENT CONTENT
-    # ========================================================
 
     def is_content_part(filename):
 
@@ -1589,10 +1788,6 @@ def validate_docx_package(
             return True
 
         return False
-
-    # ========================================================
-    # OPEN DOCX
-    # ========================================================
 
     with ZipFile(
         docx_path,
@@ -1635,10 +1830,6 @@ def validate_docx_package(
                 "w": W_NS
             }
 
-            # =================================================
-            # EXTRACT ACTUAL HUMAN-READABLE TEXT ONLY
-            # =================================================
-
             text_elements = root.xpath(
                 "//w:t",
                 namespaces=namespace
@@ -1654,9 +1845,9 @@ def validate_docx_package(
                 readable_text.lower()
             )
 
-            # =================================================
+            # ================================================
             # KNOWN IDENTIFIERS
-            # =================================================
+            # ================================================
 
             for issue_type, value in sensitive_strings:
 
@@ -1670,9 +1861,9 @@ def validate_docx_package(
                         f"{filename}: {value}"
                     )
 
-            # =================================================
-            # PATIENT / ADMISSION-ID PATTERN
-            # =================================================
+            # ================================================
+            # RESIDUAL PATIENT-ID-LIKE VALUES
+            # ================================================
 
             id_matches = (
                 PATIENT_ID_PATTERN.findall(
@@ -1687,39 +1878,9 @@ def validate_docx_package(
                     f"{filename}: {match}"
                 )
 
-            # =================================================
-            # PHONE NUMBERS
-            # =================================================
-            #
-            # Only scan visible/readable text.
-            #
-            # This prevents numbers from:
-            #
-            #   fontTable.xml
-            #   numbering.xml
-            #   settings.xml
-            #   XML attributes
-            #
-            # from being mistaken for telephone numbers.
-            # =================================================
-
-            phone_matches = (
-                PHONE_PATTERN.findall(
-                    readable_text
-                )
-            )
-
-            for match in phone_matches:
-
-                issues.append(
-                    f"Phone-like value remains in "
-                    f"{filename}: "
-                    f"{match}"
-                )
-
-            # =================================================
+            # ================================================
             # COMMENT MARKERS
-            # =================================================
+            # ================================================
 
             comment_nodes = root.xpath(
                 "//w:commentRangeStart"
@@ -1735,9 +1896,9 @@ def validate_docx_package(
                     f"{filename}"
                 )
 
-            # =================================================
+            # ================================================
             # TRACKED CHANGES
-            # =================================================
+            # ================================================
 
             revision_nodes = root.xpath(
                 "//w:ins"
@@ -1753,10 +1914,6 @@ def validate_docx_package(
                     f"Tracked-change markup remains in "
                     f"{filename}"
                 )
-
-    # ========================================================
-    # REMOVE DUPLICATES
-    # ========================================================
 
     issues = list(
         dict.fromkeys(
@@ -1786,10 +1943,8 @@ def anonymise_document(
     # DISCOVERY BEFORE MODIFICATION
     # ========================================================
 
-    identifiers = (
-        find_patient_identifiers(
-            document
-        )
+    identifiers = find_patient_identifiers(
+        document
     )
 
     staff_names = set(
@@ -1805,7 +1960,7 @@ def anonymise_document(
     changes = 0
 
     # ========================================================
-    # MAIN BODY PARAGRAPHS
+    # BODY PARAGRAPHS
     # ========================================================
 
     for paragraph in document.paragraphs:
@@ -1872,7 +2027,7 @@ def anonymise_document(
                 )
 
     # ========================================================
-    # SIGNATURE REMOVAL
+    # SIGNATURES
     # ========================================================
 
     changes += remove_signature_block(
@@ -1884,7 +2039,7 @@ def anonymise_document(
     )
 
     # ========================================================
-    # BASIC CORE PROPERTIES
+    # CORE PROPERTIES
     # ========================================================
 
     properties = (
@@ -1899,7 +2054,7 @@ def anonymise_document(
     properties.comments = ""
 
     # ========================================================
-    # SAVE DOCX
+    # SAVE
     # ========================================================
 
     output_file.parent.mkdir(
@@ -1912,7 +2067,7 @@ def anonymise_document(
     )
 
     # ========================================================
-    # FINAL OOXML PACKAGE SANITISATION
+    # OOXML SANITISATION
     # ========================================================
 
     package_changes = (
@@ -1927,7 +2082,7 @@ def anonymise_document(
     changes += package_changes
 
     # ========================================================
-    # FINAL PACKAGE VALIDATION
+    # VALIDATION
     # ========================================================
 
     validation_issues = (
@@ -1948,7 +2103,7 @@ def anonymise_document(
 
 
 # ============================================================
-# SAFE OUTPUT FILENAME
+# CREATE OUTPUT FILENAME
 # ============================================================
 
 def create_output_filename(
@@ -2006,10 +2161,8 @@ def process_dataset():
 
     for patient_folder in patient_folders:
 
-        patient_code = (
-            get_patient_code(
-                patient_folder
-            )
+        patient_code = get_patient_code(
+            patient_folder
         )
 
         print()
@@ -2019,14 +2172,9 @@ def process_dataset():
 
         counters = {}
 
-        # ====================================================
-        # GET ALL DOCUMENTS
-        # ====================================================
-
         patient_documents = sorted(
             file
-            for file
-            in patient_folder.rglob(
+            for file in patient_folder.rglob(
                 "*.docx"
             )
             if not file.name.startswith(
@@ -2041,7 +2189,7 @@ def process_dataset():
 
         # ====================================================
         # FIRST PASS:
-        # COLLECT STAFF NAMES ACROSS PATIENT DOCUMENTS
+        # COLLECT STAFF NAMES ACROSS PATIENT
         # ====================================================
 
         patient_staff_names = set()
@@ -2063,30 +2211,20 @@ def process_dataset():
             except Exception as error:
 
                 print(
-                    "Could not inspect "
-                    "staff names in "
+                    f"Could not inspect "
                     f"{file.name}: "
                     f"{error}"
                 )
 
-        # print(
-        #     "Patient-level staff names: "
-        #     f"{sorted(patient_staff_names)}"
-        # )
-
         # ====================================================
         # SECOND PASS:
-        # PSEUDONYMISE DOCUMENTS
+        # ANONYMISE
         # ====================================================
 
         for input_file in patient_documents:
 
-            document_type = (
-                input_file.parent.name
-                .replace(
-                    " ",
-                    "_"
-                )
+            document_type = get_document_type(
+                input_file
             )
 
             counters.setdefault(
@@ -2108,6 +2246,7 @@ def process_dataset():
                 )
             )
 
+            # Keep original category subfolder if present
             relative_parent = (
                 input_file.parent
                 .relative_to(
@@ -2121,17 +2260,6 @@ def process_dataset():
                 / relative_parent
                 / output_name
             )
-
-            # print()
-            # print(
-            #     f"Input:  "
-            #     f"{input_file.name}"
-            # )
-
-            # print(
-            #     f"Output: "
-            #     f"{output_name}"
-            # )
 
             try:
 
@@ -2147,10 +2275,6 @@ def process_dataset():
                     patient_code,
                     patient_staff_names
                 )
-
-                # --------------------------------------------
-                # Status
-                # --------------------------------------------
 
                 if validation_issues:
 
@@ -2172,6 +2296,9 @@ def process_dataset():
 
                         "NewFile":
                             output_name,
+
+                        "DocumentType":
+                            document_type,
 
                         "NamesFound":
                             "; ".join(
@@ -2223,60 +2350,11 @@ def process_dataset():
                     }
                 )
 
-                # print(
-                #     "    Patient names: "
-                #     f"{identifiers['names']}"
-                # )
-
-                # print(
-                #     "    Patient IDs: "
-                #     f"{identifiers['ids']}"
-                # )
-
-                # print(
-                #     "    DOBs: "
-                #     f"{identifiers['dobs']}"
-                # )
-
-                # print(
-                #     "    Staff: "
-                #     f"{staff_names}"
-                # )
-
-                # print(
-                #     "    Total changes: "
-                #     f"{changes}"
-                # )
-
-                # print(
-                #     "    OOXML package changes: "
-                #     f"{package_changes}"
-                # )
-
-                # if validation_issues:
-
-                #     print(
-                #         "    VALIDATION WARNINGS:"
-                #     )
-
-                #     for issue in (
-                #         validation_issues
-                #     ):
-
-                #         print(
-                #             f"        - {issue}"
-                #         )
-
-                # else:
-
-                #     print(
-                #         "    Validation: OK"
-                #     )
-
             except Exception as error:
 
                 print(
-                    f"    ERROR: "
+                    f"    ERROR in "
+                    f"{input_file.name}: "
                     f"{error}"
                 )
 
@@ -2290,6 +2368,9 @@ def process_dataset():
 
                         "NewFile":
                             output_name,
+
+                        "DocumentType":
+                            document_type,
 
                         "NamesFound":
                             "",
@@ -2332,6 +2413,7 @@ def process_dataset():
             "Patient",
             "OriginalFile",
             "NewFile",
+            "DocumentType",
             "NamesFound",
             "IDsFound",
             "DOBsFound",
@@ -2387,7 +2469,7 @@ def process_dataset():
 
     print()
     print("=" * 70)
-    print("PSEUDONYMISATION FINISHED")
+    print("ANONYMISATION FINISHED")
     print("=" * 70)
 
     print(

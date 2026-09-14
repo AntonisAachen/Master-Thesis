@@ -10,6 +10,24 @@ The primary target categories are:
 4. ICD-10-GM codes
 5. OPS codes
 
+OUTPUT LANGUAGE
+
+All normalized structured output fields must be written in English.
+
+This applies to:
+- diagnoses.text
+- comorbidities.text
+- recommendations.recommendation
+- icd10_gm.description
+- ops.description
+
+Translate these fields into English.
+
+The "evidence" field must reproduce the relevant wording from the source document as closely as possible and must remain in the original source language. Do not translate the evidence field.
+
+Medical abbreviations may be preserved when they are standard and clinically meaningful.
+
+The language of the source document does not determine the language of the normalized output. All normalized output fields must always be English.
 
 IMPORTANT RULES
 
@@ -29,7 +47,7 @@ IMPORTANT RULES
 
 8. Do not guess when the intended meaning is uncertain.
 
-9. For normalized structured fields, use the standard clinical term when the intended meaning is unambiguous.
+9. For normalized structured fields, use the standard English clinical term when the intended meaning is unambiguous.
 
 10. The "evidence" field must preserve the relevant wording from the source document. Do not silently correct spelling, abbreviations, or terminology in the evidence field.
 
@@ -60,24 +78,32 @@ COMORBIDITIES
 
 RECOMMENDATIONS
 
-20. Extract clinical recommendations, proposed interventions, treatment recommendations, diagnostic recommendations, monitoring recommendations, and other explicitly recommended actions.
+20. Extract only patient-specific clinical recommendations concerning diagnosis, treatment, monitoring, procedures, medication, or follow-up.
 
-21. Do not convert descriptions of treatment that has already occurred into recommendations unless the document explicitly presents them as a recommendation or plan.
+21. A recommendation must describe an action or clinical management decision that is specific to the patient described in the document.
+
+22. Do NOT extract standardized or administrative text as a recommendation, even if it is visually emphasized, bold, repeated, or appears near genuine clinical recommendations.
+
+23. In particular, text stating that medical responsibility or decision-making authority remains with the treating physicians, that recommendations are based on the teleconsultation, that the clinical situation may change, or that re-presentation/contact is possible must NOT be extracted.
+
+24. If the document contains only such standardized text and no patient-specific clinical recommendation, return: "recommendations": []
+
+25. Formatting such as bold text, font size, position, headings, or emphasis must not by itself determine whether text is a clinical recommendation.
 
 
 ICD-10-GM AND OPS CODING
 
-22. Use ICD-10-GM for diagnosis coding and OPS for procedure coding.
+26. Use ICD-10-GM for diagnosis coding and OPS for procedure coding.
 
-23. Only assign a code when the clinical documentation provides sufficient evidence for that code.
+27. Only assign a code when the clinical documentation provides sufficient evidence for that code.
 
-24. Do not invent coding specificity that is not supported by the document.
+28. Do not invent coding specificity that is not supported by the document.
 
-25. If a diagnosis or procedure is documented but cannot be coded confidently, do not guess.
+29. If a diagnosis or procedure is documented but cannot be coded confidently, do not guess.
 
-26. The coding task may require interpretation of explicitly documented clinical information, but codes must remain supported by the source document.
+30. The coding task may require interpretation of explicitly documented clinical information, but codes must remain supported by the source document.
 
-27. For every assigned ICD-10-GM or OPS code, provide the relevant supporting source text in the "evidence" field.
+31. For every assigned ICD-10-GM or OPS code, provide the relevant supporting source text in the "evidence" field.
 
 
 DOCUMENT:

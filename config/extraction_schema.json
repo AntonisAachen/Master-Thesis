@@ -1,42 +1,129 @@
 {
-  "document_id": "",
-  "document_type": "",
-
-  "diagnoses": [
-    {
-      "text": "",
-      "status": "confirmed | suspected | excluded | historical | unclear",
-      "evidence": ""
+  "type": "object",
+  "properties": {
+    "document_id": {
+      "type": "string"
+    },
+    "document_type": {
+      "type": "string"
+    },
+    "diagnoses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "confirmed",
+              "suspected",
+              "excluded",
+              "historical",
+              "unclear"
+            ]
+          },
+          "evidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "status",
+          "evidence"
+        ]
+      }
+    },
+    "comorbidities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "evidence"
+        ]
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "recommendation": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "recommendation",
+          "evidence"
+        ]
+      }
+    },
+    "icd10_gm": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "description",
+          "evidence"
+        ]
+      }
+    },
+    "ops": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "description",
+          "evidence"
+        ]
+      }
     }
-  ],
-
-  "comorbidities": [
-    {
-      "text": "",
-      "evidence": ""
-    }
-  ],
-
-  "recommendations": [
-    {
-      "recommendation": "",
-      "evidence": ""
-    }
-  ],
-
-  "icd10_gm": [
-    {
-      "code": "",
-      "description": "",
-      "evidence": ""
-    }
-  ],
-
-  "ops": [
-    {
-      "code": "",
-      "description": "",
-      "evidence": ""
-    }
+  },
+  "required": [
+    "document_id",
+    "document_type",
+    "diagnoses",
+    "comorbidities",
+    "recommendations",
+    "icd10_gm",
+    "ops"
   ]
 }
