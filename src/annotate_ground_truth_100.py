@@ -54,6 +54,12 @@ ANNOTATION_METADATA_FILE = (
 )
 
 SAMPLE_SIZE = 100
+
+# Documents of the same patient are not independent observations.
+# None = simple random sample of documents (patient clustering is
+# recorded in the manifest and must be handled in the analysis).
+# 1 = at most one document per patient.
+MAX_DOCUMENTS_PER_PATIENT = None
 RANDOM_SEED = 42
 
 ELIGIBLE_DOCUMENT_TYPES = {
@@ -185,30 +191,30 @@ def get_document_id(file_path):
 
 
 # ============================================================
-# PILOT EXCLUSION
+# PILOT EXCLUSION (PATIENT LEVEL)
 # ============================================================
 
-def load_pilot_document_ids():
-
+def load_pilot_ids():
     """
-    The 10 pilot documents were used for prompt/schema
-    development and must not be part of the final held-out
-    evaluation sample.
-    """
+    Return (document_ids, patient_ids) of the pilot documents.
 
-    pilot_ids = set()
+    The pilot documents were used for prompt/schema development.
+    They are excluded at PATIENT level: all documents of a pilot
+    patient are removed from the held-out pool, because other
+    documents of the same patient (same diagnoses, similar wording)
+    would carry over what was learned during development.
+
+    A missing or empty pilot manifest is a fatal error. Continuing
+    without it would silently produce a sample that is not held out.
+    """
 
     if not PILOT_MANIFEST.exists():
 
-        print(
-            "WARNING: Pilot manifest not found."
+        raise FileNotFoundError(
+            "Pilot manifest not found, so the held-out sample "
+            "cannot be checked against the pilot documents:\n"
+            f"{PILOT_MANIFEST}"
         )
-
-        print(
-            "No pilot documents will be excluded."
-        )
-
-        return pilot_ids
 
     with open(
         PILOT_MANIFEST,
@@ -218,22 +224,87 @@ def load_pilot_document_ids():
 
         manifest = json.load(f)
 
-    for result in manifest.get(
+    results = manifest.get(
         "results",
         []
-    ):
+    )
+
+    if not results:
+
+        raise ValueError(
+            "Pilot manifest contains no results:\n"
+            f"{PILOT_MANIFEST}"
+        )
+
+    document_ids = set()
+    patient_ids = set()
+
+    for result in results:
+
+        # Entries of documents that failed during the pilot used
+        # to be written without ids, so fall back to the path.
+        source_file = result.get(
+            "source_file"
+        )
 
         document_id = result.get(
             "document_id"
         )
 
+        patient_id = result.get(
+            "patient_id"
+        )
+
+        if source_file:
+
+            if not document_id:
+
+                document_id = get_document_id(
+                    Path(source_file)
+                )
+
+            if not patient_id:
+
+                patient_id = get_patient_id(
+                    Path(source_file)
+                )
+
+        if patient_id == "UNKNOWN":
+
+            patient_id = None
+
+        if not document_id and not patient_id:
+
+            raise ValueError(
+                "Cannot identify a pilot document in the "
+                f"manifest entry: {result}"
+            )
+
         if document_id:
 
-            pilot_ids.add(
+            document_ids.add(
                 document_id
             )
 
-    return pilot_ids
+        if patient_id:
+
+            patient_ids.add(
+                patient_id
+            )
+
+    return document_ids, patient_ids
+
+
+def is_pilot_document(
+    file_path,
+    pilot_document_ids,
+    pilot_patient_ids
+):
+
+    return (
+        get_document_id(file_path) in pilot_document_ids
+        or get_patient_id(file_path) in pilot_patient_ids
+    )
 
 
 # ============================================================
@@ -242,9 +313,14 @@ def load_pilot_document_ids():
 
 def find_eligible_documents():
 
-    pilot_ids = load_pilot_document_ids()
+    (
+        pilot_document_ids,
+        pilot_patient_ids
+    ) = load_pilot_ids()
 
     eligible = []
+
+    without_patient_id = 0
 
     for file_path in sorted(
         TEXT_DIR.rglob("*.txt")
@@ -255,22 +331,104 @@ def find_eligible_documents():
         )
 
         if document_type not in ELIGIBLE_DOCUMENT_TYPES:
-
             continue
 
-        document_id = get_document_id(
-            file_path
-        )
+        # Without a patient id it cannot be shown that the
+        # document is independent of the pilot patients.
+        if get_patient_id(file_path) == "UNKNOWN":
 
-        if document_id in pilot_ids:
+            without_patient_id += 1
+            continue
 
+        if is_pilot_document(
+            file_path,
+            pilot_document_ids,
+            pilot_patient_ids
+        ):
             continue
 
         eligible.append(
             file_path
         )
 
+    if without_patient_id:
+
+        print(
+            f"WARNING: {without_patient_id} documents have no "
+            f"Patient_XXXX in their path and were not "
+            f"considered."
+        )
+
     return eligible
+
+
+def check_sample_for_pilot_overlap(sample_files):
+    """
+    Check a sample that was drawn earlier against the pilot
+    patients. Annotation may already have started, so the sample
+    is never changed here. The overlap is reported and the user
+    has to decide explicitly.
+    """
+
+    (
+        pilot_document_ids,
+        pilot_patient_ids
+    ) = load_pilot_ids()
+
+    overlapping = [
+        file_path
+        for file_path in sample_files
+        if is_pilot_document(
+            file_path,
+            pilot_document_ids,
+            pilot_patient_ids
+        )
+    ]
+
+    if not overlapping:
+        return
+
+    already_annotated = count_saved_annotations(
+        overlapping
+    )
+
+    print()
+    print("!" * 80)
+    print(
+        "WARNING: the saved evaluation sample is NOT held out "
+        "from the pilot."
+    )
+    print("!" * 80)
+
+    print(
+        f"{len(overlapping)} documents belong to pilot patients "
+        f"({already_annotated} of them already annotated):"
+    )
+
+    for file_path in overlapping:
+
+        print(
+            f"  {get_patient_id(file_path)}  "
+            f"{file_path.name}"
+        )
+
+    print()
+    print(
+        "Options: delete the sample manifest and draw a new "
+        "sample (only sensible before annotating), or exclude "
+        "these documents from the final evaluation and report "
+        "that."
+    )
+
+    answer = input(
+        "Continue with this sample anyway? [y/N]: "
+    ).strip().lower()
+
+    if answer != "y":
+
+        raise SystemExit(
+            "Stopped: sample overlaps with the pilot."
+        )
 
 
 def save_sample_manifest(sample_files):
@@ -278,6 +436,24 @@ def save_sample_manifest(sample_files):
     counts = {}
 
     documents = []
+
+    _, pilot_patient_ids = load_pilot_ids()
+
+    documents_per_patient = {}
+
+    for file_path in sample_files:
+
+        patient = get_patient_id(
+            file_path
+        )
+
+        documents_per_patient[patient] = (
+            documents_per_patient.get(
+                patient,
+                0
+            )
+            + 1
+        )
 
     for file_path in sample_files:
 
@@ -322,6 +498,34 @@ def save_sample_manifest(sample_files):
         "pilot_documents_excluded":
             True,
 
+        "pilot_exclusion_level":
+            "patient",
+
+        "pilot_patients_excluded":
+            sorted(
+                pilot_patient_ids
+            ),
+
+        "max_documents_per_patient":
+            MAX_DOCUMENTS_PER_PATIENT,
+
+        "patients_in_sample":
+            len(
+                documents_per_patient
+            ),
+
+        "max_documents_from_one_patient":
+            max(
+                documents_per_patient.values()
+            ),
+
+        "documents_per_patient":
+            dict(
+                sorted(
+                    documents_per_patient.items()
+                )
+            ),
+
         "medication_plans_excluded":
             True,
 
@@ -332,9 +536,12 @@ def save_sample_manifest(sample_files):
 
         "sampling_method":
             (
-                "Simple random sample across all eligible "
-                "documents; natural document-type proportions "
-                "preserved."
+                "Random sample across all eligible documents "
+                "(all documents of pilot patients excluded); "
+                "natural document-type proportions preserved. "
+                "Documents of the same patient are clustered: "
+                "use patient-level resampling or cluster-aware "
+                "confidence intervals in the analysis."
             ),
 
         "created":
@@ -376,10 +583,56 @@ def create_sample():
         RANDOM_SEED
     )
 
-    sample_files = rng.sample(
-        eligible,
-        SAMPLE_SIZE
-    )
+    if MAX_DOCUMENTS_PER_PATIENT is None:
+
+        sample_files = rng.sample(
+            eligible,
+            SAMPLE_SIZE
+        )
+
+    else:
+
+        shuffled = rng.sample(
+            eligible,
+            len(eligible)
+        )
+
+        taken_per_patient = {}
+
+        sample_files = []
+
+        for file_path in shuffled:
+
+            patient = get_patient_id(
+                file_path
+            )
+
+            if (
+                taken_per_patient.get(patient, 0)
+                >= MAX_DOCUMENTS_PER_PATIENT
+            ):
+                continue
+
+            taken_per_patient[patient] = (
+                taken_per_patient.get(patient, 0)
+                + 1
+            )
+
+            sample_files.append(
+                file_path
+            )
+
+            if len(sample_files) == SAMPLE_SIZE:
+                break
+
+        if len(sample_files) < SAMPLE_SIZE:
+
+            raise ValueError(
+                f"Only {len(sample_files)} documents can be "
+                f"drawn with MAX_DOCUMENTS_PER_PATIENT="
+                f"{MAX_DOCUMENTS_PER_PATIENT}, but "
+                f"SAMPLE_SIZE={SAMPLE_SIZE}."
+            )
 
     # Stable annotation order after random selection.
     sample_files = sorted(
@@ -464,7 +717,13 @@ def load_or_create_sample():
             f"Manifest:\n{SAMPLE_MANIFEST}"
         )
 
-        return load_existing_sample()
+        sample_files = load_existing_sample()
+
+        check_sample_for_pilot_overlap(
+            sample_files
+        )
+
+        return sample_files
 
     print()
     print(
@@ -2244,6 +2503,11 @@ def print_sample_summary(
 
     print(
         f"Documents: {len(sample_files)}"
+    )
+
+    print(
+        f"Patients: "
+        f"{len({get_patient_id(p) for p in sample_files})}"
     )
 
     for document_type in sorted(

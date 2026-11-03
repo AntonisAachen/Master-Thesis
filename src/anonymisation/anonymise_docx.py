@@ -6,6 +6,7 @@ Created on Thu Aug 13 06:50:49 2026
 @author: administrator
 """
 
+from functools import lru_cache
 from pathlib import Path
 from docx import Document
 
@@ -47,9 +48,308 @@ DOB_PATTERN = re.compile(
     r"\b\d{1,2}\.\d{1,2}\.\d{4}\b"
 )
 
+# German phone numbers: +49 / 0049 / 0 prefix followed by digits that
+# may be separated by single spaces, dashes or slashes. The old
+# pattern started with \b, which can never match before a "+", and
+# it also matched dosing schemes such as 0-0-1-0-0. Candidates are
+# therefore checked again in looks_like_phone_number().
 PHONE_PATTERN = re.compile(
-    r"\b(?:\+49|0)[\d\/\- ]{6,}\d\b"
+    r"(?<![\w+/\-])"
+    r"\(?"
+    r"(?:\+49|0049|0)"
+    r"(?:[ \t/\-]?\(?\d\)?){6,14}"
 )
+
+DATE_LIKE_PATTERN = re.compile(
+    r"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}"
+)
+
+
+# ------------------------------------------------------------
+# PATIENT NAME VARIANTS
+#
+# The name found in the Name/DOB table (e.g. "Mustermann, Hans")
+# is rarely written the same way in the free text. Besides the
+# literal string, the following variants are matched:
+#   - "First Last" / "Last First" / "Last, First"
+#   - each name part on its own ("Herr Mustermann")
+#   - German genitive ("Mustermanns")
+# All matching is whole-word, so a short name such as "Ali" does
+# not damage "Qualität".
+# ------------------------------------------------------------
+
+# Titles and forms of address: never treated as name parts.
+NAME_TITLE_TOKENS = {
+    "dr", "prof", "med", "dipl", "ing", "pd", "priv", "doz", "mag",
+    "herr", "herrn", "frau", "fr", "hr", "frl",
+}
+
+# Name particles: part of the full name, but never matched alone.
+NAME_PARTICLES = {
+    "von", "van", "vom", "zu", "zur", "zum", "der", "den", "de",
+    "di", "du", "la", "le", "da", "dos", "ten", "ter", "bin", "ibn",
+}
+
+# Words that can appear in a name cell without being a name. If the
+# cell says "Patient unbekannt", "Patient" must not be removed from
+# every document.
+NAME_TOKEN_STOPWORDS = {
+    "patient", "patientin", "patienten", "name", "vorname", "nachname",
+    "unbekannt", "unknown", "geb", "geboren", "datum", "männlich",
+    "weiblich", "divers", "männl", "weibl", "station", "klinik",
+    "aufnahme", "entlassung", "fall", "nummer",
+}
+
+# German adjectives that are also common surnames. As a stand-alone
+# name part they are matched only in capitalised form ("Herr Klein"),
+# so that "klein" or "groß" in clinical text is left alone.
+NAME_TOKENS_COMMON_WORDS = {
+    "klein", "gross", "groß", "lang", "kurz", "jung", "alt", "neu",
+    "schwarz", "weiss", "weiß", "braun", "hoch", "stark", "frei",
+    "fest", "voll", "recht", "gut", "reich", "arm", "bauer", "wolf",
+}
+
+NAME_MIN_TOKEN_LENGTH = 3
+
+# True: each part of the patient's name is also removed on its own
+# ("Herr Mustermann", "Hans geht es besser"). This is the safer
+# setting for privacy, but it also removes unrelated occurrences of
+# a common first name. False: only complete name variants are
+# matched (the surname alone is then NOT removed either).
+MATCH_SINGLE_NAME_PARTS = True
+
+NAME_TOKEN_PATTERN = re.compile(
+    r"[^\W\d_]+(?:[-'’][^\W\d_]+)*"
+)
+
+# German genitive and similar endings: Mustermanns, Hans', Hanses
+NAME_SUFFIX = r"(?:[’']?s|es|ens)?"
+
+
+def _name_tokens(text):
+
+    return [
+        token.strip(".,;:()")
+        for token in text.split()
+        if token.strip(".,;:()")
+    ]
+
+
+def expand_name_variants(raw_name):
+    """
+    Return a list of (variant, case_sensitive) for one name string.
+    The literal string is always included. Re-ordered and single-part
+    variants are only derived when the string looks like a person's
+    name (1-4 alphabetic parts), so that an odd cell content cannot
+    cause common words to be removed everywhere.
+    """
+
+    raw_name = " ".join(raw_name.split())
+
+    if not raw_name:
+        return []
+
+    variants = [
+        (raw_name, False)
+    ]
+
+    # Name parts without titles ("Dr. med. Hans Mustermann")
+    if "," in raw_name:
+
+        pieces = [
+            piece.strip()
+            for piece in raw_name.split(",")
+        ]
+
+        last_part = pieces[0]
+
+        first_part = " ".join(pieces[1:])
+
+    else:
+
+        last_part = None
+
+        first_part = None
+
+    def clean_tokens(text):
+
+        return [
+            token
+            for token in _name_tokens(text)
+            if token.lower().strip(".") not in NAME_TITLE_TOKENS
+        ]
+
+    if last_part is not None:
+
+        last_tokens = clean_tokens(last_part)
+
+        first_tokens = clean_tokens(first_part)
+
+        all_tokens = last_tokens + first_tokens
+
+    else:
+
+        all_tokens = clean_tokens(raw_name)
+
+        last_tokens = None
+
+        first_tokens = None
+
+    # Particles ("von", "van", ...) are lowercase and are not name
+    # parts on their own, so they are ignored for this check.
+    core_tokens = [
+        token
+        for token in all_tokens
+        if token.lower() not in NAME_PARTICLES
+    ]
+
+    person_like = (
+        1 <= len(core_tokens) <= 4
+        and all(
+            NAME_TOKEN_PATTERN.fullmatch(token)
+            and token[0].isupper()
+            for token in core_tokens
+        )
+    )
+
+    if not person_like:
+
+        return variants
+
+    full = " ".join(all_tokens)
+
+    # Order variants
+    if last_tokens is not None and first_tokens:
+
+        last = " ".join(last_tokens)
+
+        first = " ".join(first_tokens)
+
+        variants += [
+            (f"{first} {last}", False),
+            (f"{last} {first}", False),
+            (f"{last}, {first}", False),
+        ]
+
+    elif len(all_tokens) >= 2:
+
+        variants += [
+            (full, False),
+            (" ".join(reversed(all_tokens)), False),
+            (
+                f"{all_tokens[-1]}, "
+                f"{' '.join(all_tokens[:-1])}",
+                False
+            ),
+            (
+                f"{all_tokens[0]}, "
+                f"{' '.join(all_tokens[1:])}",
+                False
+            ),
+        ]
+
+    if not MATCH_SINGLE_NAME_PARTS:
+
+        return variants
+
+    # Single name parts (also the parts of hyphenated names)
+    parts = []
+
+    for token in core_tokens:
+
+        parts.append(token)
+
+        if "-" in token:
+
+            parts.extend(token.split("-"))
+
+    for part in parts:
+
+        lowered = part.lower()
+
+        if (
+            len(part) < NAME_MIN_TOKEN_LENGTH
+            or lowered in NAME_PARTICLES
+            or lowered in NAME_TOKEN_STOPWORDS
+        ):
+            continue
+
+        variants.append(
+            (
+                part,
+                lowered in NAME_TOKENS_COMMON_WORDS
+            )
+        )
+
+    return variants
+
+
+@lru_cache(maxsize=256)
+def build_name_patterns(names):
+    """
+    Compile whole-word patterns for a frozenset of raw patient
+    names. Returns a tuple of compiled regular expressions.
+    """
+
+    seen = set()
+
+    patterns = []
+
+    for raw_name in sorted(names):
+
+        for variant, case_sensitive in expand_name_variants(
+            raw_name
+        ):
+
+            key = (variant.lower(), case_sensitive)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            # Whitespace in the name matches any whitespace run
+            # (double spaces, line breaks, non-breaking spaces).
+            body = r"\s+".join(
+                re.escape(piece)
+                for piece in variant.split()
+            )
+
+            patterns.append(
+                re.compile(
+                    r"(?<!\w)"
+                    + body
+                    + NAME_SUFFIX
+                    + r"(?!\w)",
+                    0 if case_sensitive else re.IGNORECASE
+                )
+            )
+
+    return tuple(patterns)
+
+
+def looks_like_phone_number(candidate):
+
+    digits = re.sub(
+        r"\D",
+        "",
+        candidate
+    )
+
+    if not 7 <= len(digits) <= 15:
+        return False
+
+    # Real numbers contain at least one run of three digits.
+    # Dosing schemes (1-0-1-0-1) and similar do not.
+    if not re.search(r"\d{3}", candidate):
+        return False
+
+    if DATE_LIKE_PATTERN.fullmatch(
+        candidate.strip("() ")
+    ):
+        return False
+
+    return True
 
 
 # ============================================================
@@ -68,6 +368,16 @@ CP_NS = (
 
 DC_NS = "http://purl.org/dc/elements/1.1/"
 
+W_P = f"{{{W_NS}}}p"
+W_PPR = f"{{{W_NS}}}pPr"
+W_R = f"{{{W_NS}}}r"
+W_T = f"{{{W_NS}}}t"
+W_TAB = f"{{{W_NS}}}tab"
+W_BR = f"{{{W_NS}}}br"
+W_CR = f"{{{W_NS}}}cr"
+
+XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
+
 
 # ============================================================
 # BASIC HELPERS
@@ -75,6 +385,68 @@ DC_NS = "http://purl.org/dc/elements/1.1/"
 
 def get_patient_code(patient_folder):
     return patient_folder.name
+
+
+def empty_identifiers():
+
+    return {
+        "names": set(),
+        "ids": set(),
+        "dobs": set(),
+    }
+
+
+def merge_identifiers(target, source):
+
+    for key in target:
+
+        target[key].update(
+            source[key]
+        )
+
+    return target
+
+
+# Only these folder names are carried over into the output tree.
+# Any other subfolder of a patient folder may contain identifying
+# text, so it is dropped (the original path is kept in the log).
+ALLOWED_OUTPUT_SUBFOLDERS = {
+    "empfehlungen": "Empfehlungen",
+    "visitendokumentation": "Visitendokumentation",
+    "medikationsplan": "Medikationsplan",
+}
+
+
+def safe_output_subfolder(relative_parent):
+    """
+    Return (path, dropped_count): the part of the original
+    subfolder path that may be reused in the output.
+    """
+
+    kept = []
+
+    dropped = 0
+
+    for part in relative_parent.parts:
+
+        if part in ("", "."):
+            continue
+
+        canonical = ALLOWED_OUTPUT_SUBFOLDERS.get(
+            part.lower()
+        )
+
+        if canonical:
+
+            kept.append(
+                canonical
+            )
+
+        else:
+
+            dropped += 1
+
+    return Path(*kept), dropped
 
 
 def get_document_type(input_file):
@@ -286,7 +658,7 @@ def find_patient_identifiers(document):
                             )
 
             # ------------------------------------------------
-            # SEPARATE ROW LAYOUT
+            # SEPARATE ROW LAYOUT no 1
             #
             # Row X:
             # Name, Geb.-Datum
@@ -312,9 +684,12 @@ def find_patient_identifiers(document):
 
                     if (
                         "name" in label
+                        and "vorname" not in label
                         and (
                             "geb.-datum" in label
                             or "geburtsdatum" in label
+                            or "geb. datum" in label
+                            or "geb datum" in label
                         )
                         and cell_index < len(cells)
                     ):
@@ -357,6 +732,122 @@ def find_patient_identifiers(document):
                                 "names"
                             ].add(
                                 candidate
+                            )
+                                
+            # ------------------------------------------------
+            # SEPARATE ROW LAYOUT no 2
+            #
+            # Row X:
+            # Name, Vorname
+            #
+            # Row X+1:
+            # Geburtsdatum
+            #
+            # Row X+2
+            # Name, Vorname
+            #
+            # Row X+3
+            # DOB
+            # ------------------------------------------------
+            
+            if row_index >= 3:
+
+                row_name_label = rows[
+                    row_index - 3
+                ]
+
+                row_dob_label = rows[
+                    row_index - 2
+                ]
+
+                row_name_value = rows[
+                    row_index - 1
+                ]
+
+                row_dob_value = rows[
+                    row_index
+                ]
+
+                # Check corresponding cells because the
+                # structure may be part of a wider table.
+                for cell_index in range(
+                    min(
+                        len(row_name_label.cells),
+                        len(row_dob_label.cells),
+                        len(row_name_value.cells),
+                        len(row_dob_value.cells)
+                    )
+                ):
+
+                    name_label = (
+                        row_name_label.cells[
+                            cell_index
+                        ]
+                        .text
+                        .strip()
+                        .lower()
+                    )
+
+                    dob_label = (
+                        row_dob_label.cells[
+                            cell_index
+                        ]
+                        .text
+                        .strip()
+                        .lower()
+                    )
+
+                    name_value = (
+                        row_name_value.cells[
+                            cell_index
+                        ]
+                        .text
+                        .strip()
+                    )
+
+                    dob_value = (
+                        row_dob_value.cells[
+                            cell_index
+                        ]
+                        .text
+                        .strip()
+                    )
+
+                    if (
+                        "name" in name_label
+                        and "vorname" in name_label
+                        and "geburtsdatum" in dob_label
+                    ):
+
+                        # -----------------------------
+                        # Actual patient name
+                        # -----------------------------
+
+                        if (
+                            name_value
+                            and not PATIENT_ID_PATTERN.fullmatch(
+                                name_value
+                            )
+                        ):
+
+                            identifiers[
+                                "names"
+                            ].add(
+                                name_value
+                            )
+
+                        # -----------------------------
+                        # Actual DOB
+                        # -----------------------------
+
+                        for dob in DOB_PATTERN.findall(
+                            dob_value
+                        ):
+
+                            identifiers[
+                                "dobs"
+                            ].add(
+                                dob
                             )
 
             # ------------------------------------------------
@@ -614,6 +1105,175 @@ def find_staff_names(document):
 # ANONYMISE TEXT
 # ============================================================
 
+def find_replacements(
+    text,
+    identifiers,
+    patient_code,
+    staff_names
+):
+    """
+    Find everything in `text` that has to be replaced.
+
+    Returns a sorted list of non-overlapping (start, end, replacement)
+    tuples that refer to positions in `text`.
+
+    All matches are collected on the ORIGINAL text in a single pass.
+    If matches overlap, the category listed first wins (patient name,
+    patient ID, date of birth, staff, phone number), then the longer
+    match. This is the same priority the previous sequential
+    replacement had.
+
+    Returning positions (instead of a new string) allows the same
+    result to be applied across Word runs without destroying the
+    formatting, see apply_replacements_to_segments().
+    """
+
+    candidates = []
+
+    def add_literals(
+        values,
+        replacement,
+        priority,
+        ignore_case=True,
+        whole_word=False
+    ):
+
+        for value in values:
+
+            if not value:
+                continue
+
+            body = re.escape(
+                value
+            )
+
+            if whole_word:
+
+                body = rf"\b{body}\b"
+
+            pattern = re.compile(
+                body,
+                re.IGNORECASE if ignore_case else 0
+            )
+
+            for match in pattern.finditer(text):
+
+                candidates.append(
+                    (
+                        priority,
+                        match.start(),
+                        match.end(),
+                        replacement
+                    )
+                )
+
+    # Names: all variants, whole-word (see expand_name_variants)
+    for pattern in build_name_patterns(
+        frozenset(
+            name
+            for name in identifiers["names"]
+            if name
+        )
+    ):
+
+        for match in pattern.finditer(text):
+
+            candidates.append(
+                (
+                    0,
+                    match.start(),
+                    match.end(),
+                    patient_code
+                )
+            )
+
+    # IDs are long and distinctive, so they are matched anywhere
+    # (not whole-word): an ID glued to other characters must not
+    # survive.
+    add_literals(
+        identifiers["ids"],
+        patient_code,
+        1
+    )
+
+    add_literals(
+        identifiers["dobs"],
+        "[DOB_REMOVED]",
+        2,
+        ignore_case=False
+    )
+
+    add_literals(
+        staff_names,
+        "[STAFF_REMOVED]",
+        3,
+        whole_word=True
+    )
+
+    for match in PHONE_PATTERN.finditer(text):
+
+        start, end = match.span()
+
+        candidate = text[start:end]
+
+        # Do not swallow a closing bracket that belongs to the
+        # surrounding text: "(Tel 0241 123456)".
+        while (
+            candidate.endswith(")")
+            and candidate.count(")") > candidate.count("(")
+        ):
+
+            end -= 1
+            candidate = candidate[:-1]
+
+        if looks_like_phone_number(candidate):
+
+            candidates.append(
+                (
+                    4,
+                    start,
+                    end,
+                    "[PHONE_REMOVED]"
+                )
+            )
+
+    candidates.sort(
+        key=lambda c: (
+            c[0],
+            -(c[2] - c[1]),
+            c[1]
+        )
+    )
+
+    accepted = []
+
+    for _, start, end, replacement in candidates:
+
+        overlaps = any(
+            start < accepted_end
+            and accepted_start < end
+            for accepted_start, accepted_end, _ in accepted
+        )
+
+        if not overlaps:
+
+            accepted.append(
+                (
+                    start,
+                    end,
+                    replacement
+                )
+            )
+
+    accepted.sort()
+
+    return [
+        (start, end, replacement)
+        for start, end, replacement in accepted
+        if text[start:end] != replacement
+    ]
+
+
 def anonymise_text(
     text,
     identifiers,
@@ -624,90 +1284,37 @@ def anonymise_text(
     if not text:
         return text, 0
 
-    original = text
-
-    # ========================================================
-    # PATIENT NAMES
-    # ========================================================
-
-    for name in sorted(
-        identifiers["names"],
-        key=len,
-        reverse=True
-    ):
-
-        if not name:
-            continue
-
-        text = re.sub(
-            re.escape(name),
-            patient_code,
-            text,
-            flags=re.IGNORECASE
-        )
-
-    # ========================================================
-    # PATIENT / ADMISSION IDS
-    # ========================================================
-
-    for patient_id in sorted(
-        identifiers["ids"],
-        key=len,
-        reverse=True
-    ):
-
-        text = re.sub(
-            re.escape(patient_id),
-            patient_code,
-            text,
-            flags=re.IGNORECASE
-        )
-
-    # ========================================================
-    # DOB
-    # ========================================================
-
-    for dob in identifiers["dobs"]:
-
-        text = text.replace(
-            dob,
-            "[DOB_REMOVED]"
-        )
-
-    # ========================================================
-    # STAFF
-    # ========================================================
-
-    for staff_name in sorted(
-        staff_names,
-        key=len,
-        reverse=True
-    ):
-
-        if not staff_name:
-            continue
-
-        text = re.sub(
-            rf"\b{re.escape(staff_name)}\b",
-            "[STAFF_REMOVED]",
-            text,
-            flags=re.IGNORECASE
-        )
-
-    # ========================================================
-    # PHONE
-    # ========================================================
-
-    text = PHONE_PATTERN.sub(
-        "[PHONE_REMOVED]",
-        text
+    replacements = find_replacements(
+        text,
+        identifiers,
+        patient_code,
+        staff_names
     )
 
-    changed = int(
-        text != original
+    if not replacements:
+        return text, 0
+
+    parts = []
+
+    position = 0
+
+    for start, end, replacement in replacements:
+
+        parts.append(
+            text[position:start]
+        )
+
+        parts.append(
+            replacement
+        )
+
+        position = end
+
+    parts.append(
+        text[position:]
     )
 
-    return text, changed
+    return "".join(parts), 1
 
 
 # ============================================================
@@ -748,7 +1355,7 @@ def remove_structured_patient_identity(
     """
     Remove patient identity from structured Name/DOB fields.
 
-    Supports both layouts:
+    Supports three layouts:
 
     A)
         Label row:
@@ -757,17 +1364,36 @@ def remove_structured_patient_identity(
         Value row:
         Original Patient Name | 17.04.1941
 
+        Result:
+        Patient_XXXX | [DOB_REMOVED]
+
+
     B)
         Same cell:
         Name, Geb.-Datum | Original Patient Name | 17.04.1941
 
-    Results:
-
-        Patient_XXXX | [DOB_REMOVED]
-
-    or:
-
+        Result:
         Name, Geb.-Datum | Patient_XXXX | [DOB_REMOVED]
+
+
+    C)
+        Row X:
+        Name, Vorname
+
+        Row X+1:
+        Geburtsdatum
+
+        Row X+2:
+        Original Patient Name
+
+        Row X+3:
+        17.04.1941
+
+        Result:
+        Name, Vorname
+        Geburtsdatum
+        Patient_XXXX
+        [DOB_REMOVED]
     """
 
     changes = 0
@@ -786,6 +1412,117 @@ def remove_structured_patient_identity(
             )
 
             lower = text.lower()
+
+            # =================================================
+            # CASE 3:
+            # FOUR-ROW LAYOUT
+            #
+            # Name, Vorname
+            # Geburtsdatum
+            # Actual Patient Name
+            # Actual DOB
+            # =================================================
+
+            is_name_vorname_label = (
+                "name" in lower
+                and "vorname" in lower
+                and "geburtsdatum" not in lower
+                and "geb.-datum" not in lower
+            )
+
+            if is_name_vorname_label:
+
+                # Need three rows below the label row.
+                if row_index + 3 < len(rows):
+
+                    dob_label_row = rows[
+                        row_index + 1
+                    ]
+
+                    name_value_row = rows[
+                        row_index + 2
+                    ]
+
+                    dob_value_row = rows[
+                        row_index + 3
+                    ]
+
+                    if (
+                        cell_index < len(dob_label_row.cells)
+                        and cell_index < len(name_value_row.cells)
+                        and cell_index < len(dob_value_row.cells)
+                    ):
+
+                        dob_label_cell = (
+                            dob_label_row.cells[
+                                cell_index
+                            ]
+                        )
+
+                        dob_label = (
+                            dob_label_cell.text
+                            .strip()
+                            .lower()
+                        )
+
+                        if (
+                            "geburtsdatum" in dob_label
+                            or "geb.-datum" in dob_label
+                            or "geb. datum" in dob_label
+                            or "geb datum" in dob_label
+                        ):
+
+                            name_value_cell = (
+                                name_value_row.cells[
+                                    cell_index
+                                ]
+                            )
+
+                            dob_value_cell = (
+                                dob_value_row.cells[
+                                    cell_index
+                                ]
+                            )
+
+                            # Replace ONLY the patient name.
+                            if (
+                                name_value_cell.text.strip()
+                                != patient_code
+                            ):
+
+                                name_value_cell.text = (
+                                    patient_code
+                                )
+
+                                changes += 1
+
+                            # Replace ONLY the DOB.
+                            if (
+                                dob_value_cell.text.strip()
+                                != "[DOB_REMOVED]"
+                            ):
+
+                                dob_value_cell.text = (
+                                    "[DOB_REMOVED]"
+                                )
+
+                                changes += 1
+
+                            # IMPORTANT:
+                            # Keep both labels untouched:
+                            #
+                            # Name, Vorname
+                            # Geburtsdatum
+
+                            continue
+
+            # =================================================
+            # OLD IDENTITY FIELD:
+            #
+            # Name, Geb.-Datum
+            # or
+            # Name, Geburtsdatum
+            # =================================================
 
             is_identity_field = (
                 "name" in lower
@@ -872,7 +1609,6 @@ def remove_structured_patient_identity(
                 changes += 1
 
     return changes
-
 
 # ============================================================
 # REMOVE NUMMER / KK / HEIGHT / WEIGHT FIELD
@@ -1031,6 +1767,19 @@ def anonymise_table(
     changes = 0
 
     # ========================================================
+    # STRUCTURED PATIENT IDENTITY
+    #
+    # Must run BEFORE generic text anonymisation.
+    # Otherwise structural labels such as "Geburtsdatum"
+    # may be modified before the layout can be recognised.
+    # ========================================================
+
+    changes += remove_structured_patient_identity(
+        table,
+        patient_code
+    )
+
+    # ========================================================
     # NORMAL CELL CONTENT
     # ========================================================
 
@@ -1076,11 +1825,6 @@ def anonymise_table(
     # ========================================================
     # STRUCTURED SPECIAL CASES
     # ========================================================
-
-    changes += remove_structured_patient_identity(
-        table,
-        patient_code
-    )
 
     changes += remove_sensitive_structured_cell(
         table
@@ -1216,6 +1960,222 @@ def unwrap_xml_element(element):
 
 
 # ============================================================
+# PARAGRAPH-LEVEL TEXT (RUN-AWARE)
+#
+# Word splits text into runs (<w:r>/<w:t>) wherever the formatting,
+# spell-check state or editing history changes, so a name such as
+# "Mueller" can be stored as "Mue" + "ller". Matching has to be
+# done on the text of the whole paragraph, and the result has to be
+# written back into the individual runs.
+# ============================================================
+
+def collect_paragraph_segments(paragraph):
+    """
+    Return the visible text of a <w:p> in reading order as a list of
+    (text_element, text) tuples.
+
+    text_element is the <w:t> element, or None for characters that
+    must never be modified (tabs and line breaks, which are included
+    only so that words on either side of them are not glued
+    together). Paragraphs nested in text boxes are skipped; they are
+    visited as paragraphs of their own.
+    """
+
+    segments = []
+
+    def walk(element):
+
+        for child in element:
+
+            if not isinstance(child.tag, str):
+                continue
+
+            if child.tag in (W_P, W_PPR):
+                continue
+
+            if child.tag == W_T:
+
+                segments.append(
+                    (
+                        child,
+                        child.text or ""
+                    )
+                )
+
+            elif child.tag == W_TAB and element.tag == W_R:
+
+                segments.append(
+                    (
+                        None,
+                        "\t"
+                    )
+                )
+
+            elif (
+                child.tag in (W_BR, W_CR)
+                and element.tag == W_R
+            ):
+
+                segments.append(
+                    (
+                        None,
+                        "\n"
+                    )
+                )
+
+            else:
+
+                walk(child)
+
+    walk(paragraph)
+
+    return segments
+
+
+def get_paragraph_text(paragraph):
+
+    return "".join(
+        text
+        for _, text in collect_paragraph_segments(
+            paragraph
+        )
+    )
+
+
+def apply_replacements_to_segments(
+    segments,
+    replacements
+):
+    """
+    Apply (start, end, replacement) positions, as returned by
+    find_replacements(), to the runs of a paragraph.
+
+    The replacement is written into the first run that the match
+    touches; the matched characters are removed from every run they
+    span. Text outside the matches keeps the formatting of its run.
+    """
+
+    offsets = []
+
+    position = 0
+
+    for _, text in segments:
+
+        offsets.append(
+            (
+                position,
+                position + len(text)
+            )
+        )
+
+        position += len(text)
+
+    new_texts = [
+        text
+        for _, text in segments
+    ]
+
+    # Last match first, so that the positions of earlier matches
+    # are not shifted by changes in text length.
+    for start, end, replacement in sorted(
+        replacements,
+        reverse=True
+    ):
+
+        replacement_placed = False
+
+        for index, (element, _) in enumerate(segments):
+
+            segment_start, segment_end = offsets[index]
+
+            if (
+                element is None
+                or segment_end <= start
+                or segment_start >= end
+            ):
+                continue
+
+            local_start = max(start, segment_start) - segment_start
+            local_end = min(end, segment_end) - segment_start
+
+            current = new_texts[index]
+
+            insert = "" if replacement_placed else replacement
+
+            new_texts[index] = (
+                current[:local_start]
+                + insert
+                + current[local_end:]
+            )
+
+            replacement_placed = True
+
+    changed_elements = 0
+
+    for (element, original), new_text in zip(
+        segments,
+        new_texts
+    ):
+
+        if element is None or new_text == original:
+            continue
+
+        element.text = new_text
+
+        if new_text != new_text.strip():
+
+            element.set(
+                XML_SPACE,
+                "preserve"
+            )
+
+        changed_elements += 1
+
+    return changed_elements
+
+
+def anonymise_paragraph_element(
+    paragraph,
+    identifiers,
+    patient_code,
+    staff_names
+):
+    """
+    Anonymise one <w:p> element on the text of the whole
+    paragraph. Returns 1 if the paragraph was changed, else 0.
+    """
+
+    segments = collect_paragraph_segments(
+        paragraph
+    )
+
+    text = "".join(
+        segment_text
+        for _, segment_text in segments
+    )
+
+    if not text.strip():
+        return 0
+
+    replacements = find_replacements(
+        text,
+        identifiers,
+        patient_code,
+        staff_names
+    )
+
+    if not replacements:
+        return 0
+
+    apply_replacements_to_segments(
+        segments,
+        replacements
+    )
+
+    return 1
+
+
+# ============================================================
 # SANITISE WORD XML
 # ============================================================
 
@@ -1252,28 +2212,14 @@ def sanitise_word_xml(
     # READABLE TEXT
     # ========================================================
 
-    text_elements = root.xpath(
-        "//w:t",
-        namespaces=namespace
-    )
+    for paragraph in root.iter(W_P):
 
-    for element in text_elements:
-
-        if element.text is None:
-            continue
-
-        new_text, changed = anonymise_text(
-            element.text,
+        changes += anonymise_paragraph_element(
+            paragraph,
             identifiers,
             patient_code,
             staff_names
         )
-
-        if changed:
-
-            element.text = new_text
-
-            changes += changed
 
     # ========================================================
     # COMMENT MARKERS
@@ -1719,16 +2665,15 @@ def validate_docx_package(
 
     sensitive_strings = []
 
-    for value in identifiers["names"]:
-
-        if value:
-
-            sensitive_strings.append(
-                (
-                    "PATIENT_NAME",
-                    value
-                )
-            )
+    # Names are checked with the same whole-word variants that are
+    # used for removal.
+    name_patterns = build_name_patterns(
+        frozenset(
+            name
+            for name in identifiers["names"]
+            if name
+        )
+    )
 
     for value in identifiers["ids"]:
 
@@ -1830,15 +2775,13 @@ def validate_docx_package(
                 "w": W_NS
             }
 
-            text_elements = root.xpath(
-                "//w:t",
-                namespaces=namespace
-            )
-
-            readable_text = " ".join(
-                element.text
-                for element in text_elements
-                if element.text
+            # Runs are joined without a separator (as Word shows
+            # them), otherwise a name that is split across runs
+            # would never be found. Paragraphs are separated by
+            # a newline.
+            readable_text = "\n".join(
+                get_paragraph_text(paragraph)
+                for paragraph in root.iter(W_P)
             )
 
             readable_lower = (
@@ -1859,6 +2802,23 @@ def validate_docx_package(
                     issues.append(
                         f"{issue_type} remains in "
                         f"{filename}: {value}"
+                    )
+
+            # ================================================
+            # PATIENT NAME VARIANTS
+            # ================================================
+
+            for pattern in name_patterns:
+
+                name_match = pattern.search(
+                    readable_text
+                )
+
+                if name_match:
+
+                    issues.append(
+                        f"PATIENT_NAME remains in "
+                        f"{filename}: {name_match.group(0)}"
                     )
 
             # ================================================
@@ -1932,7 +2892,8 @@ def anonymise_document(
     input_file,
     output_file,
     patient_code,
-    patient_staff_names
+    patient_staff_names,
+    patient_identifiers=None
 ):
 
     document = Document(
@@ -1946,6 +2907,17 @@ def anonymise_document(
     identifiers = find_patient_identifiers(
         document
     )
+
+    # Identifiers found in ANY document of this patient apply to
+    # every document of the patient. A document whose Name/DOB
+    # table has an unexpected layout is then still cleaned with
+    # what the other documents revealed.
+    if patient_identifiers:
+
+        merge_identifiers(
+            identifiers,
+            patient_identifiers
+        )
 
     staff_names = set(
         patient_staff_names
@@ -2189,10 +3161,13 @@ def process_dataset():
 
         # ====================================================
         # FIRST PASS:
-        # COLLECT STAFF NAMES ACROSS PATIENT
+        # COLLECT STAFF NAMES AND PATIENT IDENTIFIERS
+        # ACROSS ALL DOCUMENTS OF THE PATIENT
         # ====================================================
 
         patient_staff_names = set()
+
+        patient_identifiers = empty_identifiers()
 
         for file in patient_documents:
 
@@ -2204,6 +3179,13 @@ def process_dataset():
 
                 patient_staff_names.update(
                     find_staff_names(
+                        document
+                    )
+                )
+
+                merge_identifiers(
+                    patient_identifiers,
+                    find_patient_identifiers(
                         document
                     )
                 )
@@ -2246,7 +3228,9 @@ def process_dataset():
                 )
             )
 
-            # Keep original category subfolder if present
+            # Keep the category subfolder (Empfehlungen, ...) but
+            # never any other folder name: it could contain
+            # identifying text that the anonymiser never sees.
             relative_parent = (
                 input_file.parent
                 .relative_to(
@@ -2254,10 +3238,24 @@ def process_dataset():
                 )
             )
 
+            (
+                output_subfolder,
+                dropped_folder_names
+            ) = safe_output_subfolder(
+                relative_parent
+            )
+
+            if dropped_folder_names:
+
+                print(
+                    f"    NOTE: {dropped_folder_names} subfolder "
+                    f"name(s) not carried over to the output"
+                )
+
             output_file = (
                 OUTPUT_DIR
                 / patient_code
-                / relative_parent
+                / output_subfolder
                 / output_name
             )
 
@@ -2273,7 +3271,8 @@ def process_dataset():
                     input_file,
                     output_file,
                     patient_code,
-                    patient_staff_names
+                    patient_staff_names,
+                    patient_identifiers
                 )
 
                 if validation_issues:
@@ -2293,6 +3292,9 @@ def process_dataset():
 
                         "OriginalFile":
                             input_file.name,
+
+                        "OriginalSubfolder":
+                            str(relative_parent),
 
                         "NewFile":
                             output_name,
@@ -2366,6 +3368,9 @@ def process_dataset():
                         "OriginalFile":
                             input_file.name,
 
+                        "OriginalSubfolder":
+                            str(relative_parent),
+
                         "NewFile":
                             output_name,
 
@@ -2412,6 +3417,7 @@ def process_dataset():
         fields = [
             "Patient",
             "OriginalFile",
+            "OriginalSubfolder",
             "NewFile",
             "DocumentType",
             "NamesFound",

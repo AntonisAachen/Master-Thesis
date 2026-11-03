@@ -1,0 +1,4 @@
+Patient_0004/Patient_0004_Visitendokumentation_01.txt
+Patient_0064/Patient_0064_Empfehlungen_01.txt
+Patient_0084/Patient_0084_Visitendokumentation_02.txt
+Patient_0100/Patient_0100_Empfehlungen_01.txt

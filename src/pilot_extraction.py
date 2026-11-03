@@ -6,6 +6,9 @@ import re
 import time
 from datetime import datetime
 
+import importlib.metadata
+
+import ollama
 from ollama import chat
 
 
@@ -50,6 +53,24 @@ MANIFEST_FILE = (
 )
 
 MODEL_NAME = "mistral"
+
+# Context window passed explicitly to Ollama. Without this Ollama
+# uses a small default, and a longer prompt can be cut silently,
+# so the model would never see parts of the schema or document.
+# Adjust to the document lengths and to the memory of the machine.
+NUM_CTX = 16384
+
+# Maximum number of tokens the model may generate. This stops a
+# model that gets stuck repeating array items from running until
+# the context is full. A run that hits the limit ends with
+# done_reason == "length" and is flagged in the manifest.
+NUM_PREDICT = 4096
+
+# Tokens kept free for the model's answer. A run is flagged when
+# prompt_tokens + OUTPUT_RESERVE_TOKENS would not fit in NUM_CTX.
+# Equal to NUM_PREDICT, so a prompt that passes this check can
+# always be answered in full.
+OUTPUT_RESERVE_TOKENS = NUM_PREDICT
 
 # Start small while testing structured output.
 PILOT_SIZE = 10
@@ -153,11 +174,14 @@ def select_pilot_documents():
             f"but PILOT_SIZE is {PILOT_SIZE}."
         )
 
-    random.seed(
+    # A local generator gives exactly the same selection as
+    # random.seed() + random.sample() did, without changing the
+    # global random state.
+    rng = random.Random(
         RANDOM_SEED
     )
 
-    selected = random.sample(
+    selected = rng.sample(
         files,
         PILOT_SIZE
     )
@@ -215,6 +239,105 @@ def build_prompt(
 
 
 # ============================================================
+# MODEL SETTINGS AND PROVENANCE
+# ============================================================
+
+def get_model_options():
+    """
+    Generation options sent to Ollama. Also written to the manifest,
+    so that the exact settings of a run can be reconstructed.
+    """
+
+    return {
+        "temperature": 0,
+        "num_ctx": NUM_CTX,
+        "num_predict": NUM_PREDICT,
+        "seed": RANDOM_SEED,
+    }
+
+
+def get_model_info():
+    """
+    Identify the exact model that produced the outputs.
+
+    The tag "mistral" is a moving target: if the model is updated,
+    the same tag points to different weights. The digest identifies
+    the weights. Failures are recorded instead of stopping the run.
+    """
+
+    info = {
+        "model_name": MODEL_NAME,
+        "digest": None,
+        "modified_at": None,
+        "size_bytes": None,
+        "ollama_python_version": None,
+        "error": None,
+    }
+
+    try:
+
+        info["ollama_python_version"] = (
+            importlib.metadata.version(
+                "ollama"
+            )
+        )
+
+    except Exception:
+
+        pass
+
+    try:
+
+        for entry in ollama.list().models:
+
+            name = (
+                getattr(entry, "model", None)
+                or getattr(entry, "name", None)
+            )
+
+            if name in (
+                MODEL_NAME,
+                f"{MODEL_NAME}:latest"
+            ):
+
+                info["digest"] = getattr(
+                    entry,
+                    "digest",
+                    None
+                )
+
+                info["modified_at"] = str(
+                    getattr(
+                        entry,
+                        "modified_at",
+                        None
+                    )
+                )
+
+                info["size_bytes"] = getattr(
+                    entry,
+                    "size",
+                    None
+                )
+
+                break
+
+        if info["digest"] is None:
+
+            info["error"] = (
+                f"model '{MODEL_NAME}' not found in ollama list"
+            )
+
+    except Exception as error:
+
+        info["error"] = str(
+            error
+        )
+
+    return info
+
+
+# ============================================================
 # MODEL CALL
 # ============================================================
 
@@ -246,9 +369,7 @@ def run_model(
         # Enforce the formal JSON schema.
         format=schema,
 
-        options={
-            "temperature": 0
-        }
+        options=get_model_options()
     )
 
     return (
@@ -565,6 +686,46 @@ def process_document(
     )
 
     # ========================================================
+    # CONTEXT WINDOW CHECK
+    #
+    # If the prompt does not fit in NUM_CTX the model may have
+    # received a truncated prompt, or its answer may have been
+    # cut off. Such documents must not be scored as if they had
+    # been processed normally.
+    # ========================================================
+
+    done_reason = getattr(
+        response,
+        "done_reason",
+        None
+    )
+
+    context_issues = []
+
+    if prompt_tokens is None:
+
+        context_issues.append(
+            "prompt_eval_count not reported; "
+            "context usage could not be verified"
+        )
+
+    elif prompt_tokens + OUTPUT_RESERVE_TOKENS > NUM_CTX:
+
+        context_issues.append(
+            f"prompt uses {prompt_tokens} of {NUM_CTX} "
+            f"context tokens (reserve for output: "
+            f"{OUTPUT_RESERVE_TOKENS}); the prompt may "
+            f"have been truncated"
+        )
+
+    if done_reason == "length":
+
+        context_issues.append(
+            "generation stopped at the token limit "
+            "(done_reason=length); output may be incomplete"
+        )
+
+    # ========================================================
     # RETURN PILOT METADATA
     # ========================================================
 
@@ -625,6 +786,18 @@ def process_document(
 
         "output_tokens":
             output_tokens,
+
+        "num_ctx":
+            NUM_CTX,
+
+        "done_reason":
+            done_reason,
+
+        "context_ok":
+            len(context_issues) == 0,
+
+        "context_issues":
+            context_issues,
     }
 
 
@@ -682,6 +855,15 @@ def main():
         load_prompt_template()
     )
 
+    model_info = get_model_info()
+
+    if model_info["digest"] is None:
+
+        print(
+            "WARNING: model digest could not be determined: "
+            f"{model_info['error']}"
+        )
+
     # ========================================================
     # SELECT DOCUMENTS
     # ========================================================
@@ -697,6 +879,16 @@ def main():
     print(
         f"Model: "
         f"{MODEL_NAME}"
+    )
+
+    print(
+        f"Digest: "
+        f"{model_info['digest']}"
+    )
+
+    print(
+        f"Options: "
+        f"{get_model_options()}"
     )
 
     print(
@@ -734,6 +926,20 @@ def main():
             results.append(
                 result
             )
+
+            if not result["context_ok"]:
+
+                print(
+                    "    WARNING: context window problem"
+                )
+
+                for issue in result[
+                    "context_issues"
+                ]:
+
+                    print(
+                        f"        - {issue}"
+                    )
 
             # =================================================
             # CONSOLE RESULT
@@ -785,8 +991,24 @@ def main():
                 f"{error}"
             )
 
+            # Keep the identifiers so that documents which failed
+            # are still recognised as pilot documents when the
+            # held-out evaluation sample is built.
             results.append(
                 {
+                    "patient_id":
+                        get_patient_id(
+                            text_file
+                        ),
+
+                    "document_id":
+                        text_file.stem,
+
+                    "document_type":
+                        get_document_type(
+                            text_file
+                        ),
+
                     "source_file":
                         str(text_file),
 
@@ -820,6 +1042,12 @@ def main():
 
         "random_seed":
             RANDOM_SEED,
+
+        "model_info":
+            model_info,
+
+        "model_options":
+            get_model_options(),
 
         "created":
             datetime.now().isoformat(),
@@ -909,6 +1137,16 @@ def main():
     print(
         f"Errors: "
         f"{errors}"
+    )
+
+    context_problems = sum(
+        result.get("context_ok", True) is False
+        for result in results
+    )
+
+    print(
+        f"Context window problems: "
+        f"{context_problems}"
     )
 
     print(
